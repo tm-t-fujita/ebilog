@@ -1,0 +1,643 @@
+#include <Wire.h>
+#include<Adafruit_GFX.h>
+#include<Adafruit_SSD1306.h>
+#include <EEPROM.h>
+#include <SD.h>
+
+//disp-------------
+#define disp_address 0x3C
+#define SCREEN_WIDTH 128  //OLED 幅指定
+#define SCREEN_HEIGHT 64  //OLED 高さ指定
+#define OLED_RESET -1     //リセット端子（未使用-1）
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+   
+
+//rtc--------------
+#define RTC_address 0x68
+    uint8_t RTC_table[7];
+    uint8_t yy,mo,dd,hh,mi,ss;
+    int ssdec,midec;    
+//do sensor---------------
+    const int DO_SENSOR_1 = A0;
+    const int DO_SENSOR_2 = A1;
+    const int DO_SENSOR_3 = A2;
+    const int DO_SENSOR_4 = A3;
+
+    const int valve_1_pin = 2;
+    const int valve_2_pin = 3; 
+    const int valve_3_pin = 4;
+    float do_val[4];
+    float do_val0[10]; //0:現在値 1～9:過去値
+    float do_val1[10];
+    float do_val2[10];
+    float do_val3[10];
+    int data_num = 10 ; //移動平均母数
+    
+//SD
+    const int cs_pin = 10;
+
+//sw,led
+    const int sw_up = 8;
+    const int sw_down = 7;
+    const int sw_slct = 6;
+    const int card_detect = 9;
+    const int LED = 5;
+    int val = 0;
+    int slct_pos = 0;
+    String slct[8];
+
+//バルブ操作閾値
+    float do_thr_upper[]={10.9,7.9,8.4};//バルブ閉 閾値
+    float do_thr_lower[]={10.1,7.1,7.6};    //バルブ開 閾値
+    float do_offset;
+    float do_magnif;
+    int valve[3];//バルブの数
+    int valve_memo[3];
+
+//status
+    int sd_ok ;
+    int err_code;
+    int onetime1 , onetime2 ,onetime3, up_disp , do_read , page , page_index ;
+
+    const int TIMER_COUNTER = 34286; // 2Hz. (65536 - 16MHz/256scale/2Hz)
+
+    const uint8_t SLOT_SIZE = 2;
+
+    File myFile;
+    String file_name;
+//-----------------------------
+    void setup()
+    {
+      err_code = 0;
+     // Open serial communications and wait for port to open:
+      Serial.begin(9600);
+       while (!Serial) 
+       {
+        ; // wait for serial port to connect. Needed for Leonardo only
+       }
+//閾値設定初期化・・・EEPROM使うと動作不安定になるので、、仕方なし
+      EEPROM.get(0x00,do_thr_upper[0]);
+      EEPROM.get(0x04,do_thr_upper[1]);
+      EEPROM.get(0x08,do_thr_upper[2]);
+      EEPROM.get(0x0c,do_thr_lower[0]);
+      EEPROM.get(0x10,do_thr_lower[1]);
+      EEPROM.get(0x14,do_thr_lower[2]);
+      //do_thr_upper[0] = 10.9;
+      //do_thr_upper[1] = 7.9;
+      //do_thr_upper[2] = 8.4;
+      //do_thr_lower[0] = 10.1; 
+      //do_thr_lower[1] = 7.1; 
+      //do_thr_lower[2] = 7.6;   
+      
+//表示器
+      if(display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println(F("SSD1306 allocation ok"));
+      }
+      else{
+        Serial.println(F("SSD1306 allocation failed"));
+      }
+      
+      display.clearDisplay();
+
+      display.setTextSize(2);             // Normal 1:1 pixel scale
+      display.setTextColor(SSD1306_WHITE);        // Draw white text
+      display.setCursor(0,0);             // Start at top-left corner
+      display.println(F("2022"));
+      display.setTextSize(3);             // Draw 2X-scale text
+      display.setTextColor(SSD1306_WHITE);
+      display.println(F("EBILOG"));
+      display.setTextSize(2);
+      display.setTextColor(SSD1306_WHITE); 
+      display.println(F("TANEMAKI"));
+      display.display();
+      delay(1000);
+       
+//SDカード
+      Serial.print("Initializing SD card...");
+      if (!SD.begin(cs_pin)) 
+      {
+        Serial.println("initialization failed!");
+        err_code = 1;
+      }
+      else
+      {
+        Serial.println("initialization done.");
+      }
+      //if (SD.exists("ebilog.TXT")) 
+      //{
+      //  Serial.println("ebilog.TXT exists.");
+        //Serial.println("Removing ebilog.TXT...");
+        //SD.remove("ebilog.TXT");
+      //}
+      //else 
+      //{
+      //  Serial.println("ebilog.TXT doesn't exist.");
+      //}
+
+//IO設定
+      pinMode(LED, OUTPUT);
+      pinMode(sw_up, INPUT_PULLUP);
+      pinMode(sw_down, INPUT_PULLUP);
+      pinMode(sw_slct, INPUT_PULLUP);
+      pinMode(card_detect, INPUT_PULLUP);
+     
+      pinMode(DO_SENSOR_1, INPUT);
+      pinMode(DO_SENSOR_2, INPUT);
+      pinMode(DO_SENSOR_3, INPUT);
+      pinMode(DO_SENSOR_4, INPUT);
+
+      pinMode(valve_1_pin, OUTPUT);
+      pinMode(valve_2_pin, OUTPUT);
+      pinMode(valve_3_pin, OUTPUT);
+
+// initialize Timer1
+//      noInterrupts(); // disable all interrupts
+//      TCCR1A  = 0;
+//      TCCR1B  = 0;
+//      TCNT1   = TIMER_COUNTER;
+//      TCCR1B |= (1 << CS12);
+//      TIMSK1 |= (1 << TOIE1); // enable timer overflow interrupt
+//      interrupts(); // enable all interrupts
+
+//RTC----------------------
+      Wire.begin();
+      //RTC i2cアドレス指定
+      Wire.beginTransmission(RTC_address);
+//      Wire.write(0x00);//Register 先頭アドレス
+      //RTC 時刻設定（時刻忘れたとき用）通常時は※部をコメントアウト
+//      Wire.write(0x00);//second //※
+//      Wire.write(0x36);//minute //※
+//      Wire.write(0x14);//hour   //※
+//      Wire.write(0x04);//week   //※
+//      Wire.write(0x07);//day    //※
+//      Wire.write(0x12);//month  //※
+//      Wire.write(0x22);//year   //※
+      Wire.endTransmission();
+    
+    }
+
+    
+    uint16_t counter = 0;
+    uint8_t  slot = 0;
+    bool     readyToSave = false;
+    uint16_t value1,value2,value3,value4;
+    
+//BCD-decimal
+    byte bcd2dec ( byte data )
+    {
+      return ((( data >> 4 ) * 10 ) + ( data % 16 ));
+    }
+
+    
+//割り込み処理
+//    ISR(TIMER1_OVF_vect)
+//    {
+//      do_val[0] = analogRead(DO_SENSOR_1);
+//      do_val[1] = analogRead(DO_SENSOR_2);
+//      do_val[2] = analogRead(DO_SENSOR_3);
+//      do_val[3] = analogRead(DO_SENSOR_4);
+//      
+//      if (++counter == SLOT_SIZE) 
+//      {
+//        readyToSave = true;
+//        counter = 0;
+//        slot ^= 1;
+//      }
+//     
+//      TCNT1 = TIMER_COUNTER; // preload timer
+//    }
+
+//データをSDカードに保存
+    void save(uint8_t slotToSave)
+    {  
+//SDカードチェック
+      sd_ok = SD.begin(cs_pin);
+      if (sd_ok = 0)
+      {
+        err_code = 2; 
+      }
+      //file_name = "ebilog" + String(yy,HEX) + String(mo,HEX) + ".TXT";
+      //myFile = SD.open(file_name,FILE_WRITE);
+      myFile = SD.open("ebilog.TXT", FILE_WRITE);
+      if (myFile) 
+      {
+//保存データ-----------          
+        myFile.print(yy,HEX);
+        myFile.print("/");
+        myFile.print(mo,HEX);
+        myFile.print("/");
+        myFile.print(dd,HEX);
+        myFile.print(" ");
+        myFile.print(hh,HEX);
+        myFile.print(":");
+        myFile.print(mi,HEX);
+        myFile.print(":");
+        myFile.print(ss,HEX);
+        myFile.print(",DO, ");
+//--------------     
+        myFile.print(do_val[0]);
+        myFile.print(",");
+        myFile.print(do_val[1]);
+        myFile.print(",");
+        myFile.print(do_val[3]);//3=C
+        myFile.print(",");
+        myFile.print(do_val[2]);//2=D
+//------------
+        myFile.print(",valve,");
+        myFile.print(valve[0]);
+        myFile.print(",");
+        myFile.print(valve[1]);
+        myFile.print(",");
+        myFile.print(valve[2]);
+        myFile.print(",err,");
+        myFile.println(err_code);
+
+
+//シリアルモニタ用        
+//file name-------------
+        //Serial.print("file_name:");
+        //Serial.println(file_name);
+//time stamp-------------
+        Serial.print("time_now");
+        Serial.print(yy,HEX);
+        Serial.print("/");
+        Serial.print(mo,HEX);
+        Serial.print("/");
+        Serial.print(dd,HEX);
+        Serial.print(" ");
+        Serial.print(hh,HEX);
+        Serial.print(":");
+        Serial.print(mi,HEX);
+        Serial.print(":");
+        Serial.print(ssdec);//,HEX);
+        Serial.print(" DO ");
+ //do data------------------
+        Serial.print(do_val[0]);
+        Serial.print(", ");
+        Serial.print(do_val[1]);
+        Serial.print(", ");
+        Serial.print(do_val[3]);
+        Serial.print(", ");
+        Serial.print(do_val[2]);
+        Serial.print(", ");
+        
+//valve control status--------------------
+        Serial.print("valve");
+        Serial.print(valve[0]);
+        Serial.print(", ");
+        Serial.print(valve[1]);
+        Serial.print(", ");
+        Serial.print(valve[2]);
+//other status
+        Serial.print(" button");
+        Serial.print(digitalRead(sw_up));
+        Serial.print(digitalRead(sw_down));
+        Serial.print(digitalRead(sw_slct));
+        Serial.print("  err_code:");
+        Serial.println(err_code);
+        Serial.print("");
+        Serial.print("");
+          
+        myFile.close();
+        
+      } 
+      else 
+      {
+        // if the file didn't open, print an error:
+        Serial.println("error : can't open text file.");
+        err_code = 2 ;
+      }
+    }
+
+//バルブコントロール
+    void o2control(int i){
+      if (do_val[i] < do_thr_lower[i]){
+        valve[i]=1;
+      }
+      else if (do_val[i] > do_thr_upper[i]){
+        valve[i]=0;
+      }
+      digitalWrite(valve_1_pin,valve[0]);
+      digitalWrite(valve_2_pin,valve[1]);
+      digitalWrite(valve_3_pin,valve[2]);
+
+//-----------------------
+//バルブの状態変化でreadytosave
+      if (valve_memo[i] != valve[i])
+      {
+         readyToSave = true;
+         valve_memo[i] = valve[i];
+      }
+//---------------------
+    }
+
+//rtc時刻読み取り
+    void reed_rtc()
+    {
+      Wire.beginTransmission(RTC_address);
+      Wire.write(0x00);//Register 先頭アドレス
+      Wire.endTransmission();
+      Wire.requestFrom(RTC_address,7);
+      for(int i=0;i<=7;i++){
+      RTC_table[i]=Wire.read();
+      }
+      yy = RTC_table[6];
+      mo = RTC_table[5];
+      dd = RTC_table[4];
+      hh = RTC_table[2];
+      mi = RTC_table[1];
+      ss = RTC_table[0];
+     
+// err
+      if (ss == 255){
+        err_code = 3;
+      }
+
+//データ保存タイミング
+      ssdec = bcd2dec(ss);
+      midec = bcd2dec(mi);
+      if (midec % 5 == 0) //5分に一回保存
+      //if (ssdec == 0) //1分に一回保存
+      { 
+        if (onetime1 == 0)
+        {  
+          readyToSave = true;
+          onetime1 = 1;
+        }
+      }     
+      else {
+        onetime1 =0 ;           
+      }
+      
+//画面更新タイミング
+      if (page == 0 )//ページ0の時は2秒に一回更新
+      {
+        if (ssdec % 2 == 0)
+        { 
+          if (onetime2 == 0)
+          {  
+            up_disp = true;
+            onetime2 = 1;
+          }
+        }     
+        else {
+          onetime2 =0 ;   
+         
+        }
+      }
+      else//ページが0でない時はなるはや更新
+      {
+        up_disp = true;
+      }
+
+//Doチェックタイミング
+      if (ssdec % 5 == 0) //5秒に一回更新
+      { 
+        if (onetime3 == 0)
+        {  
+          do_read = true;
+          onetime3 = 1;
+        }
+      }     
+      else {
+        onetime3 =0 ;           
+      }
+    }
+    
+    
+//do値読み取り 10点移動平均処理
+    void reed_do()
+    {
+      do_offset = 196 ; //センサ出力4mAの時のAD値
+      do_magnif = 0.02543  ; //20mA時のDO指示値を(センサ出力20mAの時のAD値-offset)で割った値
+
+      //移動平均　過去値メモリシフト
+      for(int i=data_num-1;i>0;i--)
+      {
+        do_val0[i] = do_val0[i-1];
+        do_val1[i] = do_val1[i-1];
+        do_val2[i] = do_val2[i-1];
+        do_val3[i] = do_val3[i-1];
+      }
+      //移動平均　現在値取得
+      do_val0[0] = (analogRead(DO_SENSOR_1) - do_offset) * do_magnif;
+      do_val1[0] = (analogRead(DO_SENSOR_2) - do_offset) * do_magnif;
+      do_val2[0] = (analogRead(DO_SENSOR_3) - do_offset) * do_magnif;
+      do_val3[0] = (analogRead(DO_SENSOR_4) - do_offset) * do_magnif;
+      //移動平均　クリア
+      do_val[0] = 0 ;
+      do_val[1] = 0 ;
+      do_val[2] = 0 ;
+      do_val[3] = 0 ;
+      //移動平均　総和
+      for(int i=0;i<data_num;i++)
+      {
+        do_val[0] += do_val0[i];
+        do_val[1] += do_val1[i];
+        do_val[2] += do_val2[i];
+        do_val[3] += do_val3[i];
+      }
+      //移動平均　データ数で割る
+      do_val[0] = (float)do_val[0]/data_num;
+      do_val[1] = (float)do_val[1]/data_num;
+      do_val[2] = (float)do_val[2]/data_num;
+      do_val[3] = (float)do_val[3]/data_num;
+      
+// err
+      if (analogRead(DO_SENSOR_1) == 0)
+      {
+        err_code = 5 ;
+      }
+      if (analogRead(DO_SENSOR_2) == 0)
+      {
+        err_code = 6 ;
+      }
+      //水槽C
+      if (analogRead(DO_SENSOR_3) == 0)
+      {
+        err_code = 7 ;
+      }
+      //水槽D
+      if (analogRead(DO_SENSOR_4) == 0)
+      {
+        err_code = 8 ;
+      }
+      
+    }
+//表示器
+    void disp()
+    {
+      if ( page == 0 )
+      {
+        display.setTextSize(2);             // Normal 1:1 pixel scale
+        display.setTextColor(SSD1306_WHITE);        // Draw white text
+        display.setCursor(0,0);
+        display.clearDisplay();
+        display.println("A:" + String(do_val[0]) +" :" + String(valve[0]));// +" "+ String(do_thr_lower[0])+"-"+ String(do_thr_upper[0]));
+        display.println("B:" + String(do_val[1]) +" :" + String(valve[1]));// +" "+ String(do_thr_lower[1])+"-"+ String(do_thr_upper[1]));
+        display.println("D:" + String(do_val[2]) +" :" + String(valve[2]));// +" "+ String(do_thr_lower[2])+"-"+ String(do_thr_upper[2]));
+        display.println(String(hh,HEX) + ":" + String(mi,HEX) + " E" + String(err_code));
+        display.display();
+      }
+      else if (page == 7)
+      {
+        display.setTextSize(2);             // Normal 1:1 pixel scale
+        display.setTextColor(SSD1306_WHITE);        // Draw white text
+        display.setCursor(0,0);
+        display.clearDisplay();
+        display.println("A:" + String(do_val0[0]));
+        display.println("B:" + String(do_val1[0]));
+        display.println("C:" + String(do_val3[0]));
+        display.println("D:" + String(do_val2[0]));
+        display.display();
+      }
+      else
+      {
+        display.setTextSize(2);             // Normal 1:1 pixel scale
+        display.setTextColor(SSD1306_WHITE);        // Draw white text
+        display.setCursor(0,0);
+        display.clearDisplay();
+        display.println("ajust mode" + String(page));
+        switch (page)
+        {
+          case 1:
+            display.println("close A" );
+            display.println(do_thr_upper[0]);
+          break;
+          case 2:
+            display.println("close B" );
+            display.println(do_thr_upper[1]);
+          break;
+          case 3:
+            display.println("close D" );
+            display.println(do_thr_upper[2]);
+          break;
+
+          case 4://5
+            display.println("open A" );
+            display.println(do_thr_lower[0]);
+          break;
+          case 5://6
+            display.println("open B" );
+            display.println(do_thr_lower[1]);
+          break;
+          case 6://7
+            display.println("open D" );
+            display.println(do_thr_lower[2]);
+          break;          
+        }
+        display.display();
+      }
+    }
+
+    void reed_sw()
+    {
+      if (digitalRead(sw_slct) == 0)//セレクトボタンでページめくり
+      {
+        page = page + 1;
+        if (page == 8)
+        {
+          EEPROM.put(0x00,do_thr_upper[0]);
+          EEPROM.put(0x04,do_thr_upper[1]);
+          EEPROM.put(0x08,do_thr_upper[2]);
+          EEPROM.put(0x0c,do_thr_lower[0]);
+          EEPROM.put(0x10,do_thr_lower[1]);
+          EEPROM.put(0x14,do_thr_lower[2]);
+          page = 0;
+        }
+      }
+      if (1 <= page | page <= 3)//1-4
+      {
+        page_index = page - 1;
+        if (digitalRead(sw_up) == 0)
+        {
+          do_thr_upper[page_index] = do_thr_upper[page_index] + 0.1 ;
+        }
+        if (digitalRead(sw_down) == 0)
+        {
+          do_thr_upper[page_index] = do_thr_upper[page_index] - 0.1 ;
+        }
+      }
+      if (4 <= page | page <= 6)//5-8
+      {
+        page_index = page - 4;
+        if (digitalRead(sw_up) == 0)
+        {
+          do_thr_lower[page_index] = do_thr_lower[page_index] + 0.1 ;
+        }
+        if (digitalRead(sw_down) == 0)
+        {
+          do_thr_lower[page_index] = do_thr_lower[page_index] - 0.1 ;
+        }  
+      }
+    }
+   
+//main
+    void loop()
+    {
+
+//時刻読み取り
+      reed_rtc(); 
+      
+//センサ読み取り
+      if ( do_read == 1 )
+      {
+        reed_do();
+        do_read = false;
+      }
+      
+//スイッチ読み取り
+      reed_sw();
+
+//バルブ制御 
+      if ( do_val0[9] != 0 ) //10点移動平均のデータが揃ったら制御する
+      {     
+        for (int i = 0; i <= 2 ; i++) 
+        {
+          o2control(i);
+        }
+      }
+
+//表示更新
+      //if(1)//デバグ用 
+      if (up_disp == 1 )
+      {
+        disp();
+        up_disp = false;
+      }
+
+//データをSDカードに保存
+      //SDカードは有るか
+      if (digitalRead(card_detect) == 1)
+      {
+        err_code = 9 ;
+      }
+
+      //if(1)//デバグ用 
+      if (readyToSave == 1 && do_val0[9] != 0) 
+      {
+        save(slot ^ 1);
+        readyToSave = false;
+      }
+
+//エラーLED
+      if (err_code == 0)
+      {
+        digitalWrite(LED, 1); 
+      }
+      else
+      {
+        digitalWrite(LED, 0); 
+        //Serial.print("err_code");
+        //Serial.println(err_code);
+        //エラー時は強制バルブ閉
+        //digitalWrite(valve_1_pin,0);
+        //digitalWrite(valve_2_pin,0);
+        //digitalWrite(valve_3_pin,0);
+        //digitalWrite(valve_4_pin,0);
+        //エラー時処理停止      
+        //while(1){}
+      }
+        
+      delay(100);
+    }
